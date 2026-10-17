@@ -747,3 +747,441 @@ fn full_round_trip_keeps_rune_custody_equal_to_circulating_supply() {
     assert_eq!(balance(&env.svm, &ata(&bob, &env.mint)), 120_000_000);
     assert_invariant(&env);
 }
+
+// ===========================================================================
+// Token-2022 coins (metadata in the mint: MetadataPointer + TokenMetadata
+// only). Their own instructions; the same accounts, rules and request layout.
+// ===========================================================================
+const TOKEN22: Pubkey = anchor_spl::token_2022::ID;
+const EXT_MINT_CLOSE_AUTHORITY: u16 = 3;
+const EXT_IMMUTABLE_OWNER: u16 = 7;
+const EXT_PERMANENT_DELEGATE: u16 = 12;
+const EXT_TRANSFER_HOOK: u16 = 14;
+const EXT_METADATA_POINTER: u16 = 18;
+const EXT_TOKEN_METADATA: u16 = 19;
+const ANCHOR_ACCOUNT_OWNED_BY_WRONG_PROGRAM: u32 = 3007;
+
+fn ata22(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[owner.as_ref(), TOKEN22.as_ref(), mint.as_ref()], &ATA).0
+}
+fn tlv(out: &mut Vec<u8>, ty: u16, value: &[u8]) {
+    out.extend_from_slice(&ty.to_le_bytes());
+    out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    out.extend_from_slice(value);
+}
+fn borsh_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+/// Metadata kept in the mint: the pointer and the metadata itself, no
+/// authority over either.
+fn metadata_extensions(mint: &Pubkey) -> Vec<(u16, Vec<u8>)> {
+    let mut pointer = vec![0u8; 32];
+    pointer.extend_from_slice(mint.as_ref());
+    let mut meta = vec![0u8; 32];
+    meta.extend_from_slice(mint.as_ref());
+    borsh_str(&mut meta, "Sample Coin");
+    borsh_str(&mut meta, "SAMPLE");
+    borsh_str(&mut meta, "https://ipfs.io/ipfs/bafkreisample");
+    meta.extend_from_slice(&0u32.to_le_bytes());
+    vec![(EXT_METADATA_POINTER, pointer), (EXT_TOKEN_METADATA, meta)]
+}
+/// A Token-2022 mint (base, then the account type and its TLV extensions).
+fn new_mint22(
+    svm: &mut LiteSVM,
+    supply: u64,
+    decimals: u8,
+    auth: Option<Pubkey>,
+    extensions: impl FnOnce(&Pubkey) -> Vec<(u16, Vec<u8>)>,
+) -> Pubkey {
+    let k = Pubkey::new_unique();
+    let mut d = mint_bytes(supply, decimals, auth, None);
+    let ext = extensions(&k);
+    if !ext.is_empty() {
+        d.resize(165, 0);
+        d.push(1); // AccountType::Mint
+        for (t, v) in &ext {
+            tlv(&mut d, *t, v);
+        }
+    }
+    put(svm, k, TOKEN22, d);
+    k
+}
+/// A holder's Token-2022 account (as the ATA program makes it: ImmutableOwner).
+fn new_token_account22(svm: &mut LiteSVM, mint: &Pubkey, owner: &Pubkey, amount: u64) -> Pubkey {
+    let k = ata22(owner, mint);
+    let mut d = token_bytes(mint, owner, amount);
+    d.push(2); // AccountType::Account
+    tlv(&mut d, EXT_IMMUTABLE_OWNER, &[]);
+    put(svm, k, TOKEN22, d);
+    k
+}
+
+fn register22_ix(admin: &Pubkey, mint: &Pubkey, limits: MintLimits) -> Instruction {
+    ix_of(
+        ix::RegisterMint2022 { limits },
+        acc::RegisterMint2022 {
+            admin: *admin,
+            config: config_pda(),
+            mint: *mint,
+            mint_bridge: mint_bridge_pda(mint),
+            vault: vault_pda(mint),
+            token_program: TOKEN22,
+            system_program: SYSTEM,
+        },
+    )
+}
+fn bridge22_ix(env: &Env, user: &Pubkey, user_token: &Pubkey, rid: u64, amount: u64, wp: [u8; 32]) -> Instruction {
+    bridge22_ix_for(&env.fee_receiver, &env.mint, user, user_token, rid, amount, wp)
+}
+fn bridge22_ix_for(
+    fee_receiver: &Pubkey,
+    mint: &Pubkey,
+    user: &Pubkey,
+    user_token: &Pubkey,
+    rid: u64,
+    amount: u64,
+    wp: [u8; 32],
+) -> Instruction {
+    ix_of(
+        ix::BridgeToRune2022 { request_id: rid, amount, btc_witness_program: wp },
+        acc::BridgeToRune2022 {
+            user: *user,
+            config: config_pda(),
+            fee_receiver: *fee_receiver,
+            mint: *mint,
+            mint_bridge: mint_bridge_pda(mint),
+            user_token: *user_token,
+            vault: vault_pda(mint),
+            withdrawal: withdrawal_pda_of(mint, user, rid),
+            token_program: TOKEN22,
+            system_program: SYSTEM,
+        },
+    )
+}
+fn refund22_ix(attester: &Pubkey, mint: &Pubkey, rid: u64, wallet: &Pubkey) -> Instruction {
+    ix_of(
+        ix::RefundWithdrawal2022 {},
+        acc::RefundWithdrawal2022 {
+            attester: *attester,
+            config: config_pda(),
+            withdrawal: withdrawal_pda(mint, rid),
+            mint: *mint,
+            mint_bridge: mint_bridge_pda(mint),
+            vault: vault_pda(mint),
+            user: *wallet,
+            user_token: ata22(wallet, mint),
+            token_program: TOKEN22,
+            associated_token_program: ATA,
+            system_program: SYSTEM,
+        },
+    )
+}
+fn release22_ix(attester: &Pubkey, mint: &Pubkey, txid: [u8; 32], vout: u32, amount: u64, recipient: &Pubkey) -> Instruction {
+    ix_of(
+        ix::ReleaseDeposit2022 { btc_txid: txid, vout, amount },
+        acc::ReleaseDeposit2022 {
+            attester: *attester,
+            config: config_pda(),
+            mint: *mint,
+            mint_bridge: mint_bridge_pda(mint),
+            vault: vault_pda(mint),
+            receipt: receipt_pda(mint, &txid, vout),
+            recipient: *recipient,
+            recipient_token: ata22(recipient, mint),
+            token_program: TOKEN22,
+            associated_token_program: ATA,
+            system_program: SYSTEM,
+        },
+    )
+}
+
+/// Fresh chain with one Token-2022 coin (metadata in the mint), registered
+/// and enabled; the user holds USER_BAL of it.
+fn enabled22() -> Env {
+    let mut svm = LiteSVM::new();
+    set_time(&mut svm, NOW);
+    let admin = Keypair::new();
+    let guardian = Keypair::new();
+    let attester = Keypair::new();
+    let user = default_user();
+    let fee_receiver = Pubkey::new_unique();
+    for k in [&admin, &guardian, &attester, &user] {
+        svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
+    }
+    svm.airdrop(&fee_receiver, 1_000_000_000).unwrap();
+    deploy(&mut svm, &admin.pubkey());
+    let mint = new_mint22(&mut svm, ETCHY_SUPPLY, 6, None, metadata_extensions);
+    let user_token = new_token_account22(&mut svm, &mint, &user.pubkey(), USER_BAL);
+    let args = InitializeArgs {
+        admin: admin.pubkey(),
+        guardian: guardian.pubkey(),
+        attester: attester.pubkey(),
+        fee_receiver,
+        withdrawal_fee_lamports: FEE,
+    };
+    send(&mut svm, &[initialize_ix(&admin.pubkey(), &admin.pubkey(), args)], &[&admin]).unwrap();
+    let limits = MintLimits { min_withdrawal: MIN, daily_release_cap: CAP };
+    send(&mut svm, &[register22_ix(&admin.pubkey(), &mint, limits)], &[&admin]).unwrap();
+    send(&mut svm, &[enable_ix(&admin.pubkey(), &mint, 970_711, 200)], &[&admin]).unwrap();
+    Env { svm, admin, guardian, attester, fee_receiver, user, mint, user_token }
+}
+fn lock22(env: &mut Env, rid: u64, amount: u64) {
+    let user = env.user.insecure_clone();
+    let i = bridge22_ix(env, &user.pubkey(), &env.user_token.clone(), rid, amount, wp(7));
+    send(&mut env.svm, &[i], &[&user]).unwrap();
+}
+
+#[test]
+fn token_2022_register_accepts_only_metadata_only_etchy_coins() {
+    let mut env = enabled22();
+    let admin = env.admin.insecure_clone();
+    let limits = || MintLimits { min_withdrawal: MIN, daily_release_cap: CAP };
+    // The coin's vault is a plain Token-2022 account of the bridge (no
+    // extension), empty.
+    let vault = env.svm.get_account(&vault_pda(&env.mint)).unwrap();
+    assert_eq!((vault.owner, vault.data.len()), (TOKEN22, 165));
+    assert_eq!(Pubkey::try_from(&vault.data[32..64]).unwrap(), mint_bridge_pda(&env.mint));
+    assert_eq!(balance(&env.svm, &vault_pda(&env.mint)), 0);
+    let b: MintBridge = read(&env.svm, &mint_bridge_pda(&env.mint));
+    assert_eq!((b.mint, b.vault, b.enabled), (env.mint, vault_pda(&env.mint), true));
+
+    // Anything that could tax, block or take the vault's tokens is refused.
+    let someone = Pubkey::new_unique();
+    let with = |ty: u16, value: Vec<u8>| {
+        move |m: &Pubkey| {
+            let mut e = metadata_extensions(m);
+            e.push((ty, value));
+            e
+        }
+    };
+    let refused = [
+        new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, with(EXT_PERMANENT_DELEGATE, someone.to_bytes().to_vec())),
+        new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, with(EXT_MINT_CLOSE_AUTHORITY, someone.to_bytes().to_vec())),
+    ];
+    for m in refused {
+        let e = send(&mut env.svm, &[register22_ix(&admin.pubkey(), &m, limits())], &[&admin]).unwrap_err();
+        assert_eq!(e, bridge_err(BridgeError::UnsupportedTokenExtension));
+        assert!(env.svm.get_account(&mint_bridge_pda(&m)).is_none());
+    }
+    // A transfer hook: refused too.
+    let mut hook = someone.to_bytes().to_vec();
+    hook.extend_from_slice(Pubkey::new_unique().as_ref());
+    let hooked = new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, with(EXT_TRANSFER_HOOK, hook));
+    assert!(send(&mut env.svm, &[register22_ix(&admin.pubkey(), &hooked, limits())], &[&admin]).is_err());
+    assert!(env.svm.get_account(&mint_bridge_pda(&hooked)).is_none());
+
+    // The same Etchy-coin shape as SPL coins.
+    let bad_shape = [
+        new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, Some(someone), metadata_extensions), // can still mint
+        new_mint22(&mut env.svm, ETCHY_SUPPLY, 9, None, metadata_extensions),          // wrong decimals
+        new_mint22(&mut env.svm, ETCHY_SUPPLY + 1, 6, None, metadata_extensions),      // over the premine
+        new_mint22(&mut env.svm, 0, 6, None, metadata_extensions),                     // empty
+    ];
+    for m in bad_shape {
+        let e = send(&mut env.svm, &[register22_ix(&admin.pubkey(), &m, limits())], &[&admin]).unwrap_err();
+        assert_eq!(e, bridge_err(BridgeError::NotAnEtchyCoin));
+    }
+    // Admin only; once per coin; a plain Token-2022 mint (no extension) is fine.
+    let good = new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, metadata_extensions);
+    let stranger = env.user.insecure_clone();
+    let e = send(&mut env.svm, &[register22_ix(&stranger.pubkey(), &good, limits())], &[&stranger]).unwrap_err();
+    assert_eq!(e, bridge_err(BridgeError::Unauthorized));
+    send(&mut env.svm, &[register22_ix(&admin.pubkey(), &good, limits())], &[&admin]).unwrap();
+    let e = send(&mut env.svm, &[register22_ix(&admin.pubkey(), &good, limits())], &[&admin]).unwrap_err();
+    assert_eq!(e, custom(SYSTEM_ACCOUNT_IN_USE));
+    let plain = new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, |_| vec![]);
+    send(&mut env.svm, &[register22_ix(&admin.pubkey(), &plain, limits())], &[&admin]).unwrap();
+
+    // An SPL coin is never registered as a Token-2022 one, and the reverse.
+    let spl = new_mint(&mut env.svm, ETCHY_SUPPLY, 6, None, None);
+    assert!(send(&mut env.svm, &[register22_ix(&admin.pubkey(), &spl, limits())], &[&admin]).is_err());
+    let t22 = new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, metadata_extensions);
+    let e = send(&mut env.svm, &[register_ix(&admin.pubkey(), &t22, limits())], &[&admin]).unwrap_err();
+    assert_eq!(e, custom(ANCHOR_ACCOUNT_OWNED_BY_WRONG_PROGRAM));
+}
+
+#[test]
+fn token_2022_bridge_to_rune_records_the_same_request_the_cosigner_reads() {
+    let mut env = enabled22();
+    let fee_before = env.svm.get_account(&env.fee_receiver).unwrap().lamports;
+    lock22(&mut env, 9, 40_000_000);
+    assert_eq!(balance(&env.svm, &env.user_token), USER_BAL - 40_000_000);
+    assert_eq!(balance(&env.svm, &vault_pda(&env.mint)), 40_000_000);
+    assert_eq!(env.svm.get_account(&env.fee_receiver).unwrap().lamports, fee_before + FEE);
+    let key = withdrawal_pda(&env.mint, 9);
+    let w: WithdrawalRequest = read(&env.svm, &key);
+    assert_eq!(
+        (w.mint, w.user, w.user_token, w.amount, w.status, w.seq, w.request_id),
+        (env.mint, default_user().pubkey(), env.user_token, 40_000_000, WithdrawalStatus::Pending, 0, 9)
+    );
+    // Byte for byte what the Internet Computer co-signer parses.
+    let raw = env.svm.get_account(&key).unwrap().data;
+    assert_eq!(raw.len(), 202);
+    assert_eq!(&raw[8..40], env.mint.as_ref());
+    assert_eq!(u64::from_le_bytes(raw[120..128].try_into().unwrap()), 40_000_000);
+    assert_eq!(&raw[128..160], &wp(7));
+    assert_eq!(raw[160], 0);
+    let b = env.svm.get_account(&mint_bridge_pda(&env.mint)).unwrap().data;
+    assert_eq!((&b[8..40], b[84], b[85]), (env.mint.as_ref(), 1, 0));
+    assert_eq!(u64::from_le_bytes(b[72..80].try_into().unwrap()), 970_711);
+
+    // Bad input: same rules as SPL coins.
+    let user = env.user.insecure_clone();
+    let ut = env.user_token;
+    let i = bridge22_ix(&env, &user.pubkey(), &ut, 10, MIN - 1, wp(7));
+    assert_eq!(send(&mut env.svm, &[i], &[&user]).unwrap_err(), bridge_err(BridgeError::AmountTooSmall));
+    let i = bridge22_ix(&env, &user.pubkey(), &ut, 10, MIN, [0; 32]);
+    assert_eq!(send(&mut env.svm, &[i], &[&user]).unwrap_err(), bridge_err(BridgeError::InvalidBtcAddress));
+    let mut wrong_fee = bridge22_ix(&env, &user.pubkey(), &ut, 10, MIN, wp(7));
+    wrong_fee.accounts[2].pubkey = Pubkey::new_unique();
+    assert_eq!(send(&mut env.svm, &[wrong_fee], &[&user]).unwrap_err(), bridge_err(BridgeError::InvalidFeeReceiver));
+    // Someone else's tokens cannot be locked.
+    let thief = Keypair::new();
+    env.svm.airdrop(&thief.pubkey(), 1_000_000_000).unwrap();
+    let i = bridge22_ix(&env, &thief.pubkey(), &ut, 10, MIN, wp(7));
+    assert!(send(&mut env.svm, &[i], &[&thief]).is_err());
+    assert_eq!(balance(&env.svm, &ut), USER_BAL - 40_000_000);
+    // Not before the Rune is final.
+    let admin = env.admin.insecure_clone();
+    let fresh = new_mint22(&mut env.svm, ETCHY_SUPPLY, 6, None, metadata_extensions);
+    send(
+        &mut env.svm,
+        &[register22_ix(&admin.pubkey(), &fresh, MintLimits { min_withdrawal: MIN, daily_release_cap: CAP })],
+        &[&admin],
+    )
+    .unwrap();
+    let fresh_token = new_token_account22(&mut env.svm, &fresh, &user.pubkey(), USER_BAL);
+    let i = bridge22_ix_for(&env.fee_receiver, &fresh, &user.pubkey(), &fresh_token, 1, MIN, wp(7));
+    assert_eq!(send(&mut env.svm, &[i], &[&user]).unwrap_err(), bridge_err(BridgeError::NotEnabled));
+    assert_eq!(balance(&env.svm, &fresh_token), USER_BAL);
+}
+
+#[test]
+fn token_2022_refund_and_release_follow_the_same_rules() {
+    let mut env = enabled22();
+    let attester = env.attester.insecure_clone();
+    let user = default_user().pubkey();
+    lock22(&mut env, 0, 40_000_000);
+    // Refund: only to the requester's own wallet, only by the attester, once.
+    let stranger = Pubkey::new_unique();
+    let mut to_stranger = refund22_ix(&attester.pubkey(), &env.mint, 0, &user);
+    to_stranger.accounts[6].pubkey = stranger;
+    to_stranger.accounts[7].pubkey = ata22(&stranger, &env.mint);
+    assert_eq!(
+        send(&mut env.svm, &[to_stranger], &[&attester]).unwrap_err(),
+        bridge_err(BridgeError::WrongRefundAccount)
+    );
+    let u = env.user.insecure_clone();
+    let e = send(&mut env.svm, &[refund22_ix(&u.pubkey(), &env.mint, 0, &user)], &[&u]).unwrap_err();
+    assert_eq!(e, bridge_err(BridgeError::Unauthorized));
+    send(&mut env.svm, &[refund22_ix(&attester.pubkey(), &env.mint, 0, &user)], &[&attester]).unwrap();
+    assert_eq!(balance(&env.svm, &env.user_token), USER_BAL);
+    let e = send(&mut env.svm, &[refund22_ix(&attester.pubkey(), &env.mint, 0, &user)], &[&attester]).unwrap_err();
+    assert_eq!(e, bridge_err(BridgeError::NotPending));
+    // ...even after the user closed their token account (re-created).
+    lock22(&mut env, 1, USER_BAL);
+    let ut = env.user_token;
+    env.svm
+        .set_account(ut, Account { lamports: 0, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 })
+        .unwrap();
+    send(&mut env.svm, &[refund22_ix(&attester.pubkey(), &env.mint, 1, &user)], &[&attester]).unwrap();
+    assert_eq!(balance(&env.svm, &ut), USER_BAL);
+    assert_eq!(env.svm.get_account(&ut).unwrap().owner, TOKEN22);
+    assert_invariant(&env);
+
+    // Release: once per Bitcoin outpoint, to the recipient's own account
+    // (created if missing), under the daily cap. (Request 2's Runes were
+    // paid on Bitcoin: its tokens stay in the vault, backing what returns.)
+    lock22(&mut env, 2, 2 * CAP);
+    send(&mut env.svm, &[sent_ix(&attester.pubkey(), &env.mint, 2, [7; 32])], &[&attester]).unwrap();
+    let alice = Pubkey::new_unique();
+    let txid = [0xab; 32];
+    send(&mut env.svm, &[release22_ix(&attester.pubkey(), &env.mint, txid, 1, 3_000_000_000, &alice)], &[&attester])
+        .unwrap();
+    assert_eq!(balance(&env.svm, &ata22(&alice, &env.mint)), 3_000_000_000);
+    let r: DepositReceipt = read(&env.svm, &receipt_pda(&env.mint, &txid, 1));
+    assert_eq!((r.amount, r.recipient, r.vout, r.btc_txid), (3_000_000_000, alice, 1, txid));
+    let e = send(&mut env.svm, &[release22_ix(&attester.pubkey(), &env.mint, txid, 1, 1, &alice)], &[&attester])
+        .unwrap_err();
+    assert_eq!(e, custom(SYSTEM_ACCOUNT_IN_USE));
+    let e = send(&mut env.svm, &[release22_ix(&u.pubkey(), &env.mint, [1; 32], 0, 1, &alice)], &[&u]).unwrap_err();
+    assert_eq!(e, bridge_err(BridgeError::Unauthorized));
+    let e = send(&mut env.svm, &[release22_ix(&attester.pubkey(), &env.mint, [0; 32], 0, 1, &alice)], &[&attester])
+        .unwrap_err();
+    assert_eq!(e, bridge_err(BridgeError::InvalidBtcTxid));
+    let e = send(&mut env.svm, &[release22_ix(&attester.pubkey(), &env.mint, [1; 32], 0, CAP, &alice)], &[&attester])
+        .unwrap_err();
+    assert_eq!(e, bridge_err(BridgeError::DailyCapExceeded));
+    set_time(&mut env.svm, NOW + 86_400);
+    send(&mut env.svm, &[release22_ix(&attester.pubkey(), &env.mint, [1; 32], 0, CAP, &alice)], &[&attester]).unwrap();
+    assert_invariant(&env);
+
+    // Pause: nothing locks or releases; pending users can still be refunded.
+    lock22(&mut env, 3, 5 * MIN);
+    let guardian = env.guardian.insecure_clone();
+    send(&mut env.svm, &[pause_ix(&guardian.pubkey())], &[&guardian]).unwrap();
+    let i = bridge22_ix(&env, &user, &ut, 4, MIN, wp(7));
+    assert_eq!(send(&mut env.svm, &[i], &[&u]).unwrap_err(), bridge_err(BridgeError::Paused));
+    let r = release22_ix(&attester.pubkey(), &env.mint, [3; 32], 0, MIN, &alice);
+    assert_eq!(send(&mut env.svm, &[r], &[&attester]).unwrap_err(), bridge_err(BridgeError::Paused));
+    let before = balance(&env.svm, &ut);
+    send(&mut env.svm, &[refund22_ix(&attester.pubkey(), &env.mint, 3, &user)], &[&attester]).unwrap();
+    assert_eq!(balance(&env.svm, &ut), before + 5 * MIN);
+    assert_invariant(&env);
+}
+
+#[test]
+fn token_2022_and_spl_instructions_never_mix() {
+    // A Token-2022 coin cannot be moved by the SPL instructions...
+    let mut env = enabled22();
+    let (user, attester) = (env.user.insecure_clone(), env.attester.insecure_clone());
+    let (ut, fr) = (env.user_token, env.fee_receiver);
+    let i = bridge_ix(&env, &user.pubkey(), &ut, &fr, 0, MIN, wp(7));
+    assert!(send(&mut env.svm, &[i], &[&user]).is_err());
+    lock22(&mut env, 1, 10 * MIN);
+    let alice = Pubkey::new_unique();
+    let r = release_ix(&attester.pubkey(), &env.mint, [5; 32], 0, MIN, &alice);
+    assert!(send(&mut env.svm, &[r], &[&attester]).is_err());
+    let r = refund_ix(&attester.pubkey(), &env.mint, 1, &ut);
+    assert!(send(&mut env.svm, &[r], &[&attester]).is_err());
+    assert_eq!(balance(&env.svm, &vault_pda(&env.mint)), 10 * MIN);
+    assert_invariant(&env);
+
+    // ...and an SPL coin cannot be moved by the Token-2022 ones.
+    let mut spl = enabled();
+    lock(&mut spl, 0, 10 * MIN);
+    let (u2, a2) = (spl.user.insecure_clone(), spl.attester.insecure_clone());
+    let ut2 = spl.user_token;
+    let i = bridge22_ix(&spl, &u2.pubkey(), &ut2, 1, MIN, wp(7));
+    assert!(send(&mut spl.svm, &[i], &[&u2]).is_err());
+    let r = release22_ix(&a2.pubkey(), &spl.mint, [6; 32], 0, MIN, &alice);
+    assert!(send(&mut spl.svm, &[r], &[&a2]).is_err());
+    let r = refund22_ix(&a2.pubkey(), &spl.mint, 0, &u2.pubkey());
+    assert!(send(&mut spl.svm, &[r], &[&a2]).is_err());
+    assert_eq!(balance(&spl.svm, &vault_pda(&spl.mint)), 10 * MIN);
+    assert_invariant(&spl);
+}
+
+#[test]
+fn token_2022_round_trip_keeps_rune_custody_equal_to_circulating_supply() {
+    let mut env = enabled22();
+    let mut custody: u64 = ETCHY_SUPPLY;
+    let circulating = |env: &Env| ETCHY_SUPPLY - balance(&env.svm, &vault_pda(&env.mint));
+    let attester = env.attester.insecure_clone();
+    lock22(&mut env, 0, 300_000_000);
+    send(&mut env.svm, &[sent_ix(&attester.pubkey(), &env.mint, 0, [8; 32])], &[&attester]).unwrap();
+    custody -= 300_000_000;
+    assert_eq!(custody, circulating(&env));
+    lock22(&mut env, 1, 50_000_000);
+    send(&mut env.svm, &[refund22_ix(&attester.pubkey(), &env.mint, 1, &default_user().pubkey())], &[&attester])
+        .unwrap();
+    assert_eq!(custody, circulating(&env));
+    custody += 120_000_000;
+    let bob = Pubkey::new_unique();
+    send(&mut env.svm, &[release22_ix(&attester.pubkey(), &env.mint, [2; 32], 0, 120_000_000, &bob)], &[&attester])
+        .unwrap();
+    assert_eq!(custody, circulating(&env));
+    assert_eq!(balance(&env.svm, &ata22(&bob, &env.mint)), 120_000_000);
+    assert_invariant(&env);
+}

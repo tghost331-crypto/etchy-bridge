@@ -3,8 +3,8 @@
 The Solana program behind [Etchy](https://etchy.fun): a **lock vault** that
 moves an Etchy coin between Solana and Bitcoin, 1:1.
 
-Every Etchy coin exists twice: as an SPL token on Solana and as a real Bitcoin
-**Rune** whose whole premine sits in Etchy custody. Both have the same fixed
+Every Etchy coin exists twice: as a token on Solana (SPL Token or Token-2022)
+and as a real Bitcoin **Rune** whose whole premine sits in Etchy custody. Both have the same fixed
 supply (1,000,000,000 at 6 decimals) and the token has no mint authority, so
 this program never creates tokens. Coins only move in and out of the vault:
 
@@ -29,6 +29,14 @@ wallet. A request ends exactly one way: _Sent_ or _Refunded_.
 the same amount is released from the vault to the depositor's token account.
 Each Bitcoin output can be released only once (a receipt account per output).
 
+**Token kinds.** A coin is an SPL Token or a Token-2022 token, fixed by its
+mint. Each kind has its own instructions with the same accounts and rules:
+`register_mint`, `bridge_to_rune`, `refund_withdrawal`, `release_deposit`, and
+the same names ending in `_2022` for Token-2022 coins (which also pass the
+mint, for `transfer_checked`). A coin's vault is of the coin's kind, so one
+set of instructions can never move the other's coins. Requests, receipts and
+the per-coin state are the same accounts for both.
+
 ## Roles
 
 | Role | Can | Cannot |
@@ -42,6 +50,12 @@ Each Bitcoin output can be released only once (a receipt account per output).
 
 - Only Etchy-shaped coins: 6 decimals, no mint authority, no freeze authority,
   supply at most the 10^15 Rune premine.
+- Token-2022 coins may carry nothing but their own metadata (metadata pointer
+  and metadata in the mint). Anything that could tax, block or take the
+  vault's tokens (transfer fee, transfer hook, permanent delegate, close
+  authority, pause, ...) is refused at registration; a mint's extensions can
+  never change afterwards. Every Token-2022 transfer must move exactly the
+  requested amount.
 - Nothing can be bridged until the coin's Rune ID is linked, and the link can
   never change afterwards.
 - Only the program's upgrade authority can initialize it.

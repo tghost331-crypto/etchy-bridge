@@ -1,6 +1,11 @@
 //! Etchy Rune bridge (M8): a LOCK VAULT between an Etchy SPL token on Solana
 //! and the real Bitcoin Rune held in Etchy custody.
 //!
+//! Etchy coins are SPL Token or Token-2022 tokens; each kind is moved by its
+//! own instructions (`*_2022` for Token-2022), with the same accounts and
+//! rules. A coin's kind is fixed by its mint, and its vault is of the same
+//! kind, so the two sets of instructions can never move each other's coins.
+//!
 //! Every Etchy coin has a FIXED supply equal to the Rune premine (no mint
 //! authority, no freeze authority), so this program never mints or burns:
 //!  - Bridge to Rune: the holder locks tokens in the coin's vault and names a
@@ -19,6 +24,13 @@ use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+// Token-2022 coins, through their own instructions.
+use anchor_spl::token_2022::spl_token_2022::extension::{
+    BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+};
+use anchor_spl::token_2022::spl_token_2022::state::Mint as MintState2022;
+use anchor_spl::token_2022::{self as token_2022, Token2022, TransferChecked};
+use anchor_spl::token_interface::{Mint as Mint2022, TokenAccount as TokenAccount2022};
 
 declare_id!("BGEwwP6EcQAvBqZhYQXPk5jPKpiBXFXqWKag9GsZpDx2");
 
@@ -356,6 +368,242 @@ pub mod etchy_bridge {
         c.pending_admin = Pubkey::default();
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Token-2022 coins. The same bridge, rules and accounts (MintBridge,
+    // WithdrawalRequest, DepositReceipt: unchanged layouts), with the token
+    // moved by `transfer_checked`. A Token-2022 coin's vault is a Token-2022
+    // account, so it can only be moved by these instructions (and an SPL
+    // coin only by the ones above).
+    // -----------------------------------------------------------------------
+
+    /// Admin: register a Token-2022 Etchy coin. Same shape as `register_mint`,
+    /// and its mint may carry nothing but its own metadata (no transfer fee,
+    /// hook, permanent delegate, close authority, pause, ...): nothing can
+    /// tax, block or take the vault's tokens. A mint's extensions are fixed
+    /// when it is created, so this check holds for the coin's whole life.
+    pub fn register_mint_2022(ctx: Context<RegisterMint2022>, limits: MintLimits) -> Result<()> {
+        let mint = &ctx.accounts.mint;
+        require!(
+            mint.decimals == ETCHY_DECIMALS
+                && mint.supply > 0
+                && mint.supply <= ETCHY_SUPPLY
+                && mint.mint_authority.is_none()
+                && mint.freeze_authority.is_none(),
+            BridgeError::NotAnEtchyCoin
+        );
+        require_metadata_only(&ctx.accounts.mint.to_account_info())?;
+        validate_limits(&limits)?;
+        let b = &mut ctx.accounts.mint_bridge;
+        b.mint = ctx.accounts.mint.key();
+        b.vault = ctx.accounts.vault.key();
+        b.rune_block = 0;
+        b.rune_tx = 0;
+        b.enabled = false;
+        b.paused = false;
+        b.min_withdrawal = limits.min_withdrawal;
+        b.daily_release_cap = limits.daily_release_cap;
+        b.window_day = 0;
+        b.released_in_window = 0;
+        b.withdrawal_seq = 0;
+        b.total_locked = 0;
+        b.total_released = 0;
+        b.total_refunded = 0;
+        b.bump = ctx.bumps.mint_bridge;
+        b.vault_bump = ctx.bumps.vault;
+        emit!(MintRegistered { mint: b.mint, vault: b.vault });
+        Ok(())
+    }
+
+    /// Holder: `bridge_to_rune` for a Token-2022 coin.
+    pub fn bridge_to_rune_2022(
+        ctx: Context<BridgeToRune2022>,
+        request_id: u64,
+        amount: u64,
+        btc_witness_program: [u8; 32],
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        let b = &ctx.accounts.mint_bridge;
+        require!(!config.paused && !b.paused, BridgeError::Paused);
+        require!(b.enabled, BridgeError::NotEnabled);
+        require!(amount >= b.min_withdrawal && amount > 0, BridgeError::AmountTooSmall);
+        require!(
+            btc_witness_program != [0u8; 32],
+            BridgeError::InvalidBtcAddress
+        );
+        if config.withdrawal_fee_lamports > 0 {
+            system_program::transfer(
+                CpiContext::new(
+                    system_program::ID,
+                    system_program::Transfer {
+                        from: ctx.accounts.user.to_account_info(),
+                        to: ctx.accounts.fee_receiver.to_account_info(),
+                    },
+                ),
+                config.withdrawal_fee_lamports,
+            )?;
+        }
+        let before = ctx.accounts.vault.amount;
+        token_2022::transfer_checked(
+            CpiContext::new(
+                token_2022::ID,
+                TransferChecked {
+                    from: ctx.accounts.user_token.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+            ETCHY_DECIMALS,
+        )?;
+        // The vault received exactly `amount` (it is what the Rune pays).
+        ctx.accounts.vault.reload()?;
+        require!(
+            ctx.accounts.vault.amount == before.checked_add(amount).ok_or(BridgeError::Overflow)?,
+            BridgeError::TransferAmountMismatch
+        );
+        let seq = ctx.accounts.mint_bridge.withdrawal_seq;
+        let w = &mut ctx.accounts.withdrawal;
+        w.mint = ctx.accounts.mint_bridge.mint;
+        w.seq = seq;
+        w.request_id = request_id;
+        w.user = ctx.accounts.user.key();
+        w.user_token = ctx.accounts.user_token.key();
+        w.amount = amount;
+        w.btc_witness_program = btc_witness_program;
+        w.status = WithdrawalStatus::Pending;
+        w.btc_txid = [0u8; 32];
+        w.requested_at = Clock::get()?.unix_timestamp;
+        w.bump = ctx.bumps.withdrawal;
+        let b = &mut ctx.accounts.mint_bridge;
+        b.withdrawal_seq = seq.checked_add(1).ok_or(BridgeError::Overflow)?;
+        b.total_locked = b.total_locked.checked_add(amount).ok_or(BridgeError::Overflow)?;
+        emit!(WithdrawalRequested {
+            mint: b.mint,
+            seq,
+            request: w.key(),
+            user: w.user,
+            amount,
+            btc_witness_program,
+        });
+        Ok(())
+    }
+
+    /// Attester: `refund_withdrawal` for a Token-2022 coin.
+    pub fn refund_withdrawal_2022(ctx: Context<RefundWithdrawal2022>) -> Result<()> {
+        let w = &mut ctx.accounts.withdrawal;
+        require!(w.status == WithdrawalStatus::Pending, BridgeError::NotPending);
+        w.status = WithdrawalStatus::Refunded;
+        let amount = w.amount;
+        let (mint, seq) = (w.mint, w.seq);
+        let b = &mut ctx.accounts.mint_bridge;
+        b.total_refunded = b.total_refunded.checked_add(amount).ok_or(BridgeError::Overflow)?;
+        let bump = [b.bump];
+        let seeds: &[&[u8]] = &[b"mint".as_ref(), mint.as_ref(), &bump];
+        let before = ctx.accounts.user_token.amount;
+        token_2022::transfer_checked(
+            CpiContext::new_with_signer(
+                token_2022::ID,
+                TransferChecked {
+                    from: ctx.accounts.vault.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.user_token.to_account_info(),
+                    authority: ctx.accounts.mint_bridge.to_account_info(),
+                },
+                &[seeds],
+            ),
+            amount,
+            ETCHY_DECIMALS,
+        )?;
+        ctx.accounts.user_token.reload()?;
+        require!(
+            ctx.accounts.user_token.amount == before.checked_add(amount).ok_or(BridgeError::Overflow)?,
+            BridgeError::TransferAmountMismatch
+        );
+        emit!(WithdrawalRefunded { mint, seq, amount });
+        Ok(())
+    }
+
+    /// Attester: `release_deposit` for a Token-2022 coin (same receipt PDA:
+    /// every Bitcoin outpoint is still single-use).
+    pub fn release_deposit_2022(
+        ctx: Context<ReleaseDeposit2022>,
+        btc_txid: [u8; 32],
+        vout: u32,
+        amount: u64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused && !ctx.accounts.mint_bridge.paused, BridgeError::Paused);
+        require!(ctx.accounts.mint_bridge.enabled, BridgeError::NotEnabled);
+        require!(amount > 0, BridgeError::AmountTooSmall);
+        require!(btc_txid != [0u8; 32], BridgeError::InvalidBtcTxid);
+        let now = Clock::get()?.unix_timestamp;
+        let day = now.div_euclid(SECONDS_PER_DAY);
+        let b = &mut ctx.accounts.mint_bridge;
+        if b.window_day != day {
+            b.window_day = day;
+            b.released_in_window = 0;
+        }
+        let in_window = b.released_in_window.checked_add(amount).ok_or(BridgeError::Overflow)?;
+        require!(in_window <= b.daily_release_cap, BridgeError::DailyCapExceeded);
+        b.released_in_window = in_window;
+        b.total_released = b.total_released.checked_add(amount).ok_or(BridgeError::Overflow)?;
+        let r = &mut ctx.accounts.receipt;
+        r.mint = b.mint;
+        r.btc_txid = btc_txid;
+        r.vout = vout;
+        r.amount = amount;
+        r.recipient = ctx.accounts.recipient.key();
+        r.released_at = now;
+        r.bump = ctx.bumps.receipt;
+        let mint = b.mint;
+        let bump = [b.bump];
+        let seeds: &[&[u8]] = &[b"mint".as_ref(), mint.as_ref(), &bump];
+        let before = ctx.accounts.recipient_token.amount;
+        token_2022::transfer_checked(
+            CpiContext::new_with_signer(
+                token_2022::ID,
+                TransferChecked {
+                    from: ctx.accounts.vault.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.recipient_token.to_account_info(),
+                    authority: ctx.accounts.mint_bridge.to_account_info(),
+                },
+                &[seeds],
+            ),
+            amount,
+            ETCHY_DECIMALS,
+        )?;
+        ctx.accounts.recipient_token.reload()?;
+        require!(
+            ctx.accounts.recipient_token.amount
+                == before.checked_add(amount).ok_or(BridgeError::Overflow)?,
+            BridgeError::TransferAmountMismatch
+        );
+        emit!(DepositReleased {
+            mint,
+            btc_txid,
+            vout,
+            amount,
+            recipient: ctx.accounts.recipient.key(),
+        });
+        Ok(())
+    }
+}
+
+/// A Token-2022 mint with nothing but its own metadata.
+fn require_metadata_only(mint: &AccountInfo) -> Result<()> {
+    let data = mint.try_borrow_data()?;
+    let state = StateWithExtensions::<MintState2022>::unpack(&data)?;
+    let types = state.get_extension_types()?;
+    require!(
+        types
+            .iter()
+            .all(|t| matches!(t, ExtensionType::MetadataPointer | ExtensionType::TokenMetadata)),
+        BridgeError::UnsupportedTokenExtension
+    );
+    Ok(())
 }
 
 fn validate_limits(l: &MintLimits) -> Result<()> {
@@ -693,6 +941,177 @@ pub struct ReleaseDeposit<'info> {
 }
 
 // ---------------------------------------------------------------------------
+// Token-2022 accounts (same seeds, same state accounts).
+// ---------------------------------------------------------------------------
+#[derive(Accounts)]
+pub struct RegisterMint2022<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ BridgeError::Unauthorized)]
+    pub config: Account<'info, BridgeConfig>,
+    #[account(owner = token_program.key() @ BridgeError::NotAnEtchyCoin)]
+    pub mint: Box<InterfaceAccount<'info, Mint2022>>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + MintBridge::INIT_SPACE,
+        seeds = [b"mint", mint.key().as_ref()],
+        bump
+    )]
+    pub mint_bridge: Box<Account<'info, MintBridge>>,
+    #[account(
+        init,
+        payer = admin,
+        token::mint = mint,
+        token::authority = mint_bridge,
+        token::token_program = token_program,
+        seeds = [b"vault", mint.key().as_ref()],
+        bump
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    pub token_program: Program<'info, Token2022>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(request_id: u64, amount: u64, btc_witness_program: [u8; 32])]
+pub struct BridgeToRune2022<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump, has_one = fee_receiver @ BridgeError::InvalidFeeReceiver)]
+    pub config: Account<'info, BridgeConfig>,
+    /// CHECK: lamport destination pinned to config.fee_receiver via has_one.
+    #[account(mut)]
+    pub fee_receiver: UncheckedAccount<'info>,
+    #[account(owner = token_program.key())]
+    pub mint: Box<InterfaceAccount<'info, Mint2022>>,
+    #[account(
+        mut,
+        seeds = [b"mint", mint.key().as_ref()],
+        bump = mint_bridge.bump,
+        has_one = vault,
+        has_one = mint
+    )]
+    pub mint_bridge: Box<Account<'info, MintBridge>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = user,
+        token::token_program = token_program
+    )]
+    pub user_token: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = mint_bridge,
+        token::token_program = token_program
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    #[account(
+        init,
+        payer = user,
+        space = 8 + WithdrawalRequest::INIT_SPACE,
+        seeds = [b"withdrawal", mint.key().as_ref(), user.key().as_ref(), &request_id.to_le_bytes()],
+        bump
+    )]
+    pub withdrawal: Box<Account<'info, WithdrawalRequest>>,
+    pub token_program: Program<'info, Token2022>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RefundWithdrawal2022<'info> {
+    #[account(mut)]
+    pub attester: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump, has_one = attester @ BridgeError::Unauthorized)]
+    pub config: Account<'info, BridgeConfig>,
+    #[account(
+        mut,
+        seeds = [b"withdrawal", withdrawal.mint.as_ref(), withdrawal.user.as_ref(), &withdrawal.request_id.to_le_bytes()],
+        bump = withdrawal.bump,
+        has_one = user @ BridgeError::WrongRefundAccount,
+        has_one = mint
+    )]
+    pub withdrawal: Box<Account<'info, WithdrawalRequest>>,
+    #[account(owner = token_program.key())]
+    pub mint: Box<InterfaceAccount<'info, Mint2022>>,
+    #[account(
+        mut,
+        seeds = [b"mint", mint.key().as_ref()],
+        bump = mint_bridge.bump,
+        has_one = vault
+    )]
+    pub mint_bridge: Box<Account<'info, MintBridge>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = mint_bridge,
+        token::token_program = token_program
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    /// CHECK: the requester's wallet, pinned by `has_one = user` above.
+    pub user: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = attester,
+        associated_token::mint = mint,
+        associated_token::authority = user,
+        associated_token::token_program = token_program,
+    )]
+    pub user_token: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    pub token_program: Program<'info, Token2022>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(btc_txid: [u8; 32], vout: u32, amount: u64)]
+pub struct ReleaseDeposit2022<'info> {
+    #[account(mut)]
+    pub attester: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump, has_one = attester @ BridgeError::Unauthorized)]
+    pub config: Account<'info, BridgeConfig>,
+    #[account(owner = token_program.key())]
+    pub mint: Box<InterfaceAccount<'info, Mint2022>>,
+    #[account(
+        mut,
+        seeds = [b"mint", mint.key().as_ref()],
+        bump = mint_bridge.bump,
+        has_one = vault,
+        has_one = mint
+    )]
+    pub mint_bridge: Box<Account<'info, MintBridge>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = mint_bridge,
+        token::token_program = token_program
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    #[account(
+        init,
+        payer = attester,
+        space = 8 + DepositReceipt::INIT_SPACE,
+        seeds = [b"deposit", mint.key().as_ref(), &btc_txid, &vout.to_le_bytes()],
+        bump
+    )]
+    pub receipt: Box<Account<'info, DepositReceipt>>,
+    /// CHECK: any wallet; tokens go to its canonical ATA (created if needed).
+    pub recipient: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = attester,
+        associated_token::mint = mint,
+        associated_token::authority = recipient,
+        associated_token::token_program = token_program,
+    )]
+    pub recipient_token: Box<InterfaceAccount<'info, TokenAccount2022>>,
+    pub token_program: Program<'info, Token2022>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+// ---------------------------------------------------------------------------
 // Events & errors
 // ---------------------------------------------------------------------------
 #[event]
@@ -784,4 +1203,9 @@ pub enum BridgeError {
     WrongRefundAccount,
     #[msg("Arithmetic overflow")]
     Overflow,
+    // Token-2022 coins (appended: every code above keeps its number).
+    #[msg("Token-2022 coin with an extension other than its own metadata")]
+    UnsupportedTokenExtension,
+    #[msg("Token transfer moved a different amount")]
+    TransferAmountMismatch,
 }
